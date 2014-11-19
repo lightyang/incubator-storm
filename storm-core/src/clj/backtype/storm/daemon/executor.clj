@@ -250,7 +250,7 @@
      )))
 
 (defn start-batch-transfer->worker-handler! [worker executor-data]
-  (let [worker-transfer-fn (:transfer-fn worker)
+  (let [worker-transfer-fn (:transfer-fn-with-retry worker)
         cached-emit (MutableObject. (ArrayList.))
         storm-conf (:storm-conf executor-data)
         serializer (KryoTupleSerializer. storm-conf (:worker-context executor-data))

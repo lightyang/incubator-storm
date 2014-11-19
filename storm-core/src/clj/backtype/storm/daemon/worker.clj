@@ -103,14 +103,17 @@
   (let [short-executor-receive-queue-map (:short-executor-receive-queue-map worker)
         task->short-executor (:task->short-executor worker)
         task-getter (comp #(get @task->short-executor %) fast-first)]
-    (fn [tuple-batch]
-      (let [grouped (fast-group-by task-getter tuple-batch)]
+    (fn [retry-msg-fn tuple-batch]
+      (let [grouped (fast-group-by task-getter tuple-batch)
+            failed (ArrayList.)]
         (fast-map-iter [[short-executor pairs] grouped]
           (let [q (@short-executor-receive-queue-map short-executor)]
             (if q
               (disruptor/publish q pairs)
-              (log-warn "Received invalid messages for unknown tasks " short-executor ". Dropping... ")
-              )))))))
+              (do
+                (log-warn "Received invalid messages for unknown tasks " (-> pairs first first))
+                (.addAll failed pairs)))))
+        (retry-msg-fn failed)))))
 
 (defn- assert-can-serialize [^KryoTupleSerializer serializer tuple-batch]
   "Check that all of the tuples can be serialized by serializing them."
@@ -121,33 +124,57 @@
   (let [local-tasks (:task-ids worker)
         local-transfer (:transfer-local-fn worker)
         ^DisruptorQueue transfer-queue (:transfer-queue worker)
+        ^DisruptorQueue temp-outbound-queue (:temp-outbound-queue worker)
         task->node+port (:cached-task->node+port worker)
         try-serialize-local ((:conf worker) TOPOLOGY-TESTING-ALWAYS-TRY-SERIALIZE)
         transfer-fn
-          (fn [^KryoTupleSerializer serializer tuple-batch]
+          (fn [retry-msg-fn ^KryoTupleSerializer serializer tuple-batch]
             (let [local (ArrayList.)
-                  remoteMap (HashMap.)]
+                  remoteMap (HashMap.)
+                  not-outbound (ArrayList.)]
               (fast-list-iter [[task tuple :as pair] tuple-batch]
                 (if (@local-tasks task)
                   (.add local pair)
 
                   ;;Using java objects directly to avoid performance issues in java code
                   (let [node+port (get @task->node+port task)]
-                    (when (not (.get remoteMap node+port))
-                      (.put remoteMap node+port (ArrayList.)))
-                    (let [remote (.get remoteMap node+port)]
-                      (.add remote (TaskMessage. task (.serialize serializer tuple)))
-                     ))))
-                (local-transfer local)
-                (disruptor/publish transfer-queue remoteMap)
+                    (if node+port
+                      (do
+                        (when (not (.get remoteMap node+port))
+                          (.put remoteMap node+port (ArrayList.)))
+                        (let [remote (.get remoteMap node+port)
+                              msg (if (instance? Tuple tuple) (.serialize serializer tuple) tuple)]
+                          (.add remote (TaskMessage. task msg))))
+                      (if (@local-tasks task)
+                        (.add local pair)
+                        (do
+                        ;; not in outbound-tasks
+                          (log-message "Sending message to invalid task " pair)
+                          (.add not-outbound pair))
+                        )))))
+
+              (local-transfer retry-msg-fn local)
+              (disruptor/publish transfer-queue remoteMap)
+              (when-not (empty? not-outbound)
+                (disruptor/publish temp-outbound-queue not-outbound))
               ))]
     (if try-serialize-local
       (do 
         (log-warn "WILL TRY TO SERIALIZE ALL TUPLES (Turn off " TOPOLOGY-TESTING-ALWAYS-TRY-SERIALIZE " for production)")
-        (fn [^KryoTupleSerializer serializer tuple-batch]
+        (fn [retry-msg-fn ^KryoTupleSerializer serializer tuple-batch]
           (assert-can-serialize serializer tuple-batch)
-          (transfer-fn serializer tuple-batch)))
+          (transfer-fn retry-msg-fn serializer tuple-batch)))
       transfer-fn)))
+
+(defn mk-retry-msg-fn [worker]
+  (let [timer (:retry-msg-timer worker)
+        transfer-fn (:transfer-fn worker)
+        storm-conf (:storm-conf worker)
+        serializer (KryoTupleSerializer. storm-conf (worker-context worker))]
+    (fn this [tuples]
+      (when-not (empty? tuples)
+        (let [retry (fn [] (transfer-fn this serializer tuples))]
+          (schedule timer TOPOLOGY-MESSAGE-RETRY-SECS retry))))))
 
 (defn- mk-receive-queue-map [storm-conf executors]
   (->> executors
@@ -195,6 +222,8 @@
   (let [assignment-versions (atom {})
         transfer-queue (disruptor/disruptor-queue "worker-transfer-queue" (storm-conf TOPOLOGY-TRANSFER-BUFFER-SIZE)
                                                   :wait-strategy (storm-conf TOPOLOGY-DISRUPTOR-WAIT-STRATEGY))
+        temp-outbound-queue (disruptor/disruptor-queue "worker-temp-outbound-queue" (storm-conf TOPOLOGY-TRANSFER-BUFFER-SIZE)
+                                                       :wait-strategy (storm-conf TOPOLOGY-DISRUPTOR-WAIT-STRATEGY))
 
         topology (read-supervisor-topology conf storm-id)
         mq-context  (if mq-context
@@ -215,6 +244,8 @@
       :executors (atom nil)
       :task-ids (atom nil)
       :outbound-tasks (atom nil)
+      :temp-outbound-task->start-time-secs (atom {})
+      :temp-outbound-queue temp-outbound-queue
       :storm-conf storm-conf
       :topology topology
       :system-topology (system-topology! storm-conf topology)
@@ -224,6 +255,7 @@
       :refresh-active-timer (mk-halting-timer "refresh-active-timer")
       :executor-heartbeat-timer (mk-halting-timer "executor-heartbeat-timer")
       :user-timer (mk-halting-timer "user-timer")
+      :retry-msg-timer (mk-halting-timer "delay-msg-timer")
       :task->component (HashMap. (storm-task-info topology storm-conf)) ; for optimized access when used in tasks later on
       :component->stream->fields (component->stream->fields (:system-topology <>))
       :component->sorted-tasks (->> (:task->component <>) reverse-map (map-val sort))
@@ -242,6 +274,8 @@
       :receiver-thread-count (get storm-conf WORKER-RECEIVER-THREAD-COUNT)
       :transfer-fn (mk-transfer-fn <>)
       :assignment-versions assignment-versions
+      :retry-msg-fn (mk-retry-msg-fn <>)
+      :transfer-fn-with-retry (partial (:transfer-fn <>) (:retry-msg-fn <>))
       )))
 
 (defn- endpoint->string [[node port]]
@@ -264,7 +298,8 @@
             assignment-info (:data (@assignment-versions storm-id))
             new-executor-ids (set (read-worker-executors assignment-info assignment-id port))]
         (if (not= new-executor-ids old-executor-ids)
-          (let [executors-to-launch (set/difference new-executor-ids old-executor-ids)
+          (let [_ (log-message "Syncing executors " old-executor-ids " -> " new-executor-ids)
+                executors-to-launch (set/difference new-executor-ids old-executor-ids)
                 executors-to-kill (set/difference old-executor-ids new-executor-ids)
                 executor-receive-queue-map (merge
                                              (mk-receive-queue-map conf executors-to-launch)
@@ -299,6 +334,7 @@
 
 (defn mk-refresh-connections [worker executors credentials]
   (let [outbound-tasks (:outbound-tasks worker)
+        temp-outbound-task->start-time-secs (:temp-outbound-task->start-time-secs worker)
         conf (:conf worker)
         storm-cluster-state (:storm-cluster-state worker)
         storm-id (:storm-id worker)
@@ -316,12 +352,18 @@
                             (let [new-assignment (.assignment-info-with-version storm-cluster-state storm-id callback)]
                               (swap! assignment-versions assoc storm-id new-assignment)
                               (:data new-assignment)))
+
                update-executors (if version-changed? (sync-executors) (fn []))
+
+               current-time (current-time-secs)
+               _ (log-message "Removing timeout temp-outbound-tasks " current-time " " @temp-outbound-task->start-time-secs)
+               _ (swap! temp-outbound-task->start-time-secs (partial filter-key #(> (- current-time %) 10)))
+               temp-outbound-tasks (keys @temp-outbound-task->start-time-secs)
 
                my-assignment (-> assignment
                                  :executor->node+port
                                  to-task->node+port
-                                 (select-keys @outbound-tasks)
+                                 (select-keys (concat @outbound-tasks temp-outbound-tasks))
                                  (#(map-val endpoint->string %)))
                ;; we dont need a connection for the local tasks anymore
                needed-assignment (->> my-assignment
@@ -379,16 +421,40 @@
 (defn mk-transfer-tuples-handler [worker]
   (let [drainer (TransferDrainer.)
         node+port->socket (:cached-node+port->socket worker)
-        endpoint-socket-lock (:endpoint-socket-lock worker)]
+        endpoint-socket-lock (:endpoint-socket-lock worker)
+        retry-msg-fn (:retry-msg-fn worker)]
     (disruptor/clojure-handler
       (fn [packets _ batch-end?]
         (.add drainer packets)
         
         (when batch-end?
           (read-locked endpoint-socket-lock
-            (let [node+port->socket @node+port->socket]
-              (.send drainer node+port->socket)))
+            (let [node+port->socket @node+port->socket
+                  failed (.send drainer node+port->socket)]
+              (when-not (empty? failed)
+                (log-message "Missing connections for messages: " failed))
+              (retry-msg-fn (map (fn [^TaskMessage msg] [(.task msg) (.message msg)]) failed))
+              ))
           (.clear drainer))))))
+
+(defn mk-temp-outbound-transfer-handler [worker refresh-connections]
+  (let [retry-msg-fn (:retry-msg-fn worker)
+        temp-outbound-task->start-time-secs (:temp-outbound-task->start-time-secs worker)
+        messages (ArrayList.)]
+    (disruptor/clojure-handler
+      (fn [tuples _ batch-end?]
+        (.addAll messages tuples)
+
+        (when batch-end?
+          (let [tasks (set (map first messages))
+                start-time (current-time-secs)
+                task->start-time-secs (map #(vector % start-time) tasks)]
+            (log-message "Adding temp-outbound-tasks " (into () task->start-time-secs))
+            (swap! temp-outbound-task->start-time-secs into task->start-time-secs)
+            (refresh-connections)
+            (retry-msg-fn (.clone messages))
+            (.clear messages)))
+        ))))
 
 (defn launch-receive-thread [worker]
   (log-message "Launching receive-thread for " (:assignment-id worker) ":" (:port worker))
@@ -398,7 +464,7 @@
     (:storm-id worker)
     (:receiver-thread-count worker)
     (:port worker)
-    (:transfer-local-fn worker)
+    (partial (:transfer-local-fn worker) (:retry-msg-fn worker))
     (-> worker :storm-conf (get TOPOLOGY-RECEIVER-BUFFER-SIZE))
     :kill-fn (fn [t] (exit-process! 11))))
 
@@ -461,6 +527,10 @@
         transfer-tuples (mk-transfer-tuples-handler worker)
         
         transfer-thread (disruptor/consume-loop* (:transfer-queue worker) transfer-tuples)                                       
+
+        temp-outbound-transfer (mk-temp-outbound-transfer-handler worker refresh-connections)
+        temp-outbound-transfer-thread (disruptor/consume-loop* (:temp-outbound-queue worker) temp-outbound-transfer)
+
         shutdown* (fn []
                     (log-message "Shutting down worker " storm-id " " assignment-id " " port)
                     (doseq [[_ socket] @(:cached-node+port->socket worker)]
@@ -484,12 +554,18 @@
                     (.interrupt transfer-thread)
                     (.join transfer-thread)
                     (log-message "Shut down transfer thread")
+
+                    (.interrupt temp-outbound-transfer-thread)
+                    (.join temp-outbound-transfer-thread)
+                    (log-message "Shut down temp outbound transfer thread")
+
                     (cancel-timer (:heartbeat-timer worker))
                     (cancel-timer (:refresh-connections-timer worker))
                     (cancel-timer (:refresh-credentials-timer worker))
                     (cancel-timer (:refresh-active-timer worker))
                     (cancel-timer (:executor-heartbeat-timer worker))
                     (cancel-timer (:user-timer worker))
+                    (cancel-timer (:retry-msg-timer worker))
                     
                     (close-resources worker)
                     
@@ -514,6 +590,7 @@
                  (timer-waiting? (:refresh-active-timer worker))
                  (timer-waiting? (:executor-heartbeat-timer worker))
                  (timer-waiting? (:user-timer worker))
+                 (timer-waiting? (:retry-msg-timer worker))
                  ))
              )
         check-credentials-changed (fn []

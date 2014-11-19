@@ -895,6 +895,12 @@ public class Config extends HashMap<String, Object> {
     public static final Object TOPOLOGY_MESSAGE_TIMEOUT_SECS_SCHEMA = ConfigValidation.IntegerValidator;
 
     /**
+     * The amount of time a message with routing error has to wait before retry.
+     */
+    public static final String TOPOLOGY_MESSAGE_RETRY_SECS = "topology.message.retry.secs";
+    public static final Object TOPOLOGY_MESSAGE_RETRY_SECS_SCHEMA = ConfigValidation.IntegerValidator;
+
+    /**
      * A list of serialization registrations for Kryo ( http://code.google.com/p/kryo/ ),
      * the underlying serialization framework for Storm. A serialization can either
      * be the name of a class (in which case Kryo will automatically create a serializer for the class
