@@ -19,7 +19,8 @@
   (:require [backtype.storm.daemon [executor :as executor]])
   (:import [java.util.concurrent Executors])
   (:import [java.util ArrayList HashMap])
-  (:import [backtype.storm.utils TransferDrainer])
+  (:import [backtype.storm.utils TransferDrainer MutableObject])
+  (:import [backtype.storm.metric SystemBolt])
   (:import [backtype.storm.messaging TransportFactory])
   (:import [backtype.storm.messaging TaskMessage IContext IConnection])
   (:import [backtype.storm.security.auth AuthUtils])
@@ -28,6 +29,8 @@
   (:gen-class))
 
 (bootstrap)
+
+(def assignment-changed (atom false))
 
 (defmulti mk-suicide-fn cluster-mode)
 
@@ -264,7 +267,8 @@
   (let [outbound-tasks (worker-outbound-tasks worker)
         conf (:conf worker)
         storm-cluster-state (:storm-cluster-state worker)
-        storm-id (:storm-id worker)]
+        storm-id (:storm-id worker)
+        my-endpoint [(:assignment-id worker) (:port worker)]]
     (fn this
       ([]
         (this (fn [& ignored] (schedule (:refresh-connections-timer worker) 0 this))))
@@ -275,6 +279,16 @@
                             (let [new-assignment (.assignment-info-with-version storm-cluster-state storm-id callback)]
                               (swap! (:assignment-versions worker) assoc storm-id new-assignment)
                               (:data new-assignment)))
+               my-tasks (-> assignment
+                            :executor->node+port
+                            to-task->node+port
+                            reverse-map
+                            (#(.get % my-endpoint))
+                            set)
+               _ (when (and (false? @assignment-changed) (not= my-tasks (-> worker :task-ids set (#(disj % -1)))))
+                   (log-message (str "assignment-changed:" (-> worker :task-ids set (#(disj % -1)))) "--->" my-tasks)
+                   (System/setProperty "new-worker-assignment" (clojure.string/join "," my-tasks))
+                   (reset! assignment-changed true))
               my-assignment (-> assignment
                                 :executor->node+port
                                 to-task->node+port
@@ -374,14 +388,14 @@
 ;; deducable from cluster state (by searching through assignments)
 ;; what about if there's inconsistency in assignments? -> but nimbus
 ;; should guarantee this consistency
-(defserverfn mk-worker [conf shared-mq-context storm-id assignment-id port worker-id]
+(defserverfn mk-worker [conf shared-mq-context storm-id assignment-id port worker-id restart]
   (log-message "Launching worker for " storm-id " on " assignment-id ":" port " with id " worker-id
                " and conf " conf)
   (if-not (local-mode? conf)
     (redirect-stdio-to-slf4j!))
   ;; because in local mode, its not a separate
   ;; process. supervisor will register it in this case
-  (when (= :distributed (cluster-mode conf))
+  (when (and (= restart false) (= :distributed (cluster-mode conf)))
     (touch (worker-pid-path conf worker-id (process-pid))))
   (let [storm-conf (read-supervisor-storm-conf conf storm-id)
         storm-conf (override-login-config-with-system-property storm-conf)
@@ -419,23 +433,21 @@
         transfer-thread (disruptor/consume-loop* (:transfer-queue worker) transfer-tuples)                                       
         shutdown* (fn []
                     (log-message "Shutting down worker " storm-id " " assignment-id " " port)
-                    (doseq [[_ socket] @(:cached-node+port->socket worker)]
-                      ;; this will do best effort flushing since the linger period
-                      ;; was set on creation
-                      (.close socket))
                     (log-message "Shutting down receive thread")
                     (receive-thread-shutdown)
                     (log-message "Shut down receive thread")
+
                     (log-message "Terminating messaging context")
-                    (log-message "Shutting down executors")
-                    (doseq [executor @executors] (.shutdown executor))
-                    (log-message "Shut down executors")
-                                        
                     ;;this is fine because the only time this is shared is when it's a local context,
                     ;;in which case it's a noop
                     (.term ^IContext (:mq-context worker))
+
                     (log-message "Shutting down transfer thread")
                     (disruptor/halt-with-interrupt! (:transfer-queue worker))
+
+                    (log-message "Shutting down executors")
+                    (doseq [executor @executors] (.shutdown executor))
+                    (log-message "Shut down executors")
 
                     (.interrupt transfer-thread)
                     (.join transfer-thread)
@@ -446,6 +458,11 @@
                     (cancel-timer (:refresh-active-timer worker))
                     (cancel-timer (:executor-heartbeat-timer worker))
                     (cancel-timer (:user-timer worker))
+
+                    ; (doseq [[_ socket] @(:cached-node+port->socket worker)]
+                      ;; this will do best effort flushing since the linger period
+                      ;; was set on creation
+                      ; (.close socket))
                     
                     (close-resources worker)
                     
@@ -498,8 +515,28 @@
   :distributed [conf]
   (fn [] (exit-process! 1 "Worker died")))
 
-(defn -main [storm-id assignment-id port-str worker-id]  
-  (let [conf (read-storm-config)]
-    (validate-distributed-mode! conf)
-    (let [worker (mk-worker conf nil storm-id assignment-id (Integer/parseInt port-str) worker-id)]
-      (add-shutdown-hook-with-force-kill-in-1-sec #(.shutdown worker)))))
+(defn- check-assignment [worker-id make-shutdownable]
+  (let [shutdownableObj (MutableObject.)
+        _ (.setObject shutdownableObj (make-shutdownable false))]
+    (fn [] (when @assignment-changed
+             (log-message "assignment changed, restart worker")
+             (let [shutdownable (.getObject shutdownableObj)
+                   _ (.shutdown shutdownable)
+                   _ (log-message (str "Worker " worker-id "shutdown successfully"))
+                   _ (log-message (str "Begin to restart worker " worker-id))
+                   shutdownable (make-shutdownable true)]
+               (.setObject shutdownableObj shutdownable)
+               (reset! assignment-changed false))
+             (log-message "new worker started"))
+      100)))
+
+(defn -main [storm-id assignment-id port-str worker-id]
+  (let [conf (read-storm-config)
+        storm-conf (read-supervisor-storm-conf conf storm-id)
+        make-shutdownable (fn [restart]
+                            (mk-worker conf nil (java.net.URLDecoder/decode storm-id) assignment-id
+                                       (Integer/parseInt port-str) worker-id restart))
+        _ (validate-distributed-mode! conf)
+        check-ass-fn (check-assignment worker-id make-shutdownable)]
+    (loop [] (Utils/sleep (check-ass-fn)) (recur))
+    ))

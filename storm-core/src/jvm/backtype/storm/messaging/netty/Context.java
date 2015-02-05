@@ -48,6 +48,7 @@ public class Context implements IContext {
      */
     @SuppressWarnings("rawtypes")
     public void prepare(Map storm_conf) {
+        LOG.info("Preparing netty context");
         this.storm_conf = storm_conf;
         connections = new Vector<IConnection>();
 
@@ -73,6 +74,9 @@ public class Context implements IContext {
      */
     public IConnection bind(String storm_id, int port) {
         IConnection server = new Server(storm_conf, port);
+        if (connections == null) {
+          LOG.warn("null connections");
+        }
         connections.add(server);
         return server;
     }
