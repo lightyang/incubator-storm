@@ -236,7 +236,7 @@
       :component->stream->fields (component->stream->fields (:system-topology <>))
       :component->sorted-tasks (->> (:task->component <>) reverse-map (map-val sort))
       :endpoint-socket-lock (mk-rw-lock)
-      :cached-node+port->socket (atom {})
+      :cached-node+port->socket (atom (HashMap.))
       :cached-task->node+port (atom {})
       :transfer-queue transfer-queue
       :executor-receive-queue-map executor-receive-queue-map
@@ -303,6 +303,8 @@
               current-connections (set (keys @(:cached-node+port->socket worker)))
               new-connections (set/difference needed-connections current-connections)
               remove-connections (set/difference current-connections needed-connections)]
+           (if (not @assignment-changed)
+             (do
               (swap! (:cached-node+port->socket worker)
                      #(HashMap. (merge (into {} %1) %2))
                      (into {}
@@ -330,7 +332,7 @@
                                        (filter (complement my-assignment)))]
                 (when-not (empty? missing-tasks)
                   (log-warn "Missing assignment for following tasks: " (pr-str missing-tasks))
-                  )))))))
+                  )))))))))
 
 (defn refresh-storm-active
   ([worker]
