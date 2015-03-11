@@ -170,6 +170,8 @@ topology.acker.executors: null
 topology.tasks: null
 # maximum amount of time a message has to complete before it's considered failed
 topology.message.timeout.secs: 30
+# amount of time a message with routing error has to wait before retry
+topology.message.retry.secs: 1
 topology.multilang.serializer: "backtype.storm.multilang.JsonSerializer"
 topology.skip.missing.kryo.registrations: false
 topology.max.task.parallelism: null
@@ -196,6 +198,7 @@ topology.trident.batch.emit.interval.millis: 500
 topology.testing.always.try.serialize: false
 topology.classpath: null
 topology.environment: null
+topology.temp.connection.timeout.secs: 5
 
 dev.zookeeper.path: "/tmp/dev-storm-zookeeper"
 

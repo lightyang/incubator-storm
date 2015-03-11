@@ -15,7 +15,7 @@
 ;; limitations under the License.
 
 (ns backtype.storm.disruptor
-  (:import [backtype.storm.utils DisruptorQueue])
+  (:import [backtype.storm.utils DisruptorQueue TracedDisruptorQueue])
   (:import [com.lmax.disruptor MultiThreadedClaimStrategy SingleThreadedClaimStrategy
             BlockingWaitStrategy SleepingWaitStrategy YieldingWaitStrategy
             BusySpinWaitStrategy])
@@ -49,6 +49,13 @@
   (DisruptorQueue. queue-name
                    ((CLAIM-STRATEGY claim-strategy) buffer-size)
                    (mk-wait-strategy wait-strategy)))
+
+(defnk disruptor-traced-queue
+  [conf ^String queue-name buffer-size :claim-strategy :multi-threaded :wait-strategy :block]
+  (let [trace-queue (conf "topology.queue.trace")]
+    (if (and (not-nil? trace-queue) trace-queue)
+      (TracedDisruptorQueue. queue-name ((CLAIM-STRATEGY claim-strategy) buffer-size) (mk-wait-strategy wait-strategy) conf)
+      (DisruptorQueue. queue-name ((CLAIM-STRATEGY claim-strategy) buffer-size) (mk-wait-strategy wait-strategy)))))
 
 (defn clojure-handler
   [afn]

@@ -44,17 +44,23 @@ public class TransferDrainer {
     } 
   }
   
-  public void send(HashMap<String, IConnection> connections) {
+  public ArrayList<TaskMessage> send(HashMap<String, IConnection> connections) {
+    ArrayList<TaskMessage> failed = new ArrayList<TaskMessage>();
     for (String hostPort : bundles.keySet()) {
       IConnection connection = connections.get(hostPort);
+      ArrayList<ArrayList<TaskMessage>> bundle = bundles.get(hostPort);
       if (null != connection) { 
-        ArrayList<ArrayList<TaskMessage>> bundle = bundles.get(hostPort);
         Iterator<TaskMessage> iter = getBundleIterator(bundle);
         if (null != iter && iter.hasNext()) {
           connection.send(iter);
         }
+      } else {
+        for (ArrayList<TaskMessage> messages : bundle) {
+          failed.addAll(messages);
+        }
       }
     } 
+    return failed;
   }
   
   private Iterator<TaskMessage> getBundleIterator(final ArrayList<ArrayList<TaskMessage>> bundle) {

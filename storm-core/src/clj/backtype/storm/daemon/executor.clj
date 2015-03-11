@@ -210,7 +210,8 @@
         component-id (.getComponentId worker-context (first task-ids))
         storm-conf (normalized-component-conf (:storm-conf worker) worker-context component-id)
         executor-type (executor-type worker-context component-id)
-        batch-transfer->worker (disruptor/disruptor-queue
+        batch-transfer->worker (disruptor/disruptor-traced-queue
+                                  storm-conf
                                   (str "executor"  executor-id "-send-queue")
                                   (storm-conf TOPOLOGY-EXECUTOR-SEND-BUFFER-SIZE)
                                   :claim-strategy :single-threaded
@@ -251,7 +252,7 @@
      )))
 
 (defn start-batch-transfer->worker-handler! [worker executor-data]
-  (let [worker-transfer-fn (:transfer-fn worker)
+  (let [worker-transfer-fn (:transfer-fn-with-retry worker)
         cached-emit (MutableObject. (ArrayList.))
         storm-conf (:storm-conf executor-data)
         serializer (KryoTupleSerializer. storm-conf (:worker-context executor-data))
@@ -408,20 +409,24 @@
   (let [^KryoTupleDeserializer deserializer (:deserializer executor-data)
         task-ids (:task-ids executor-data)
         debug? (= true (-> executor-data :storm-conf (get TOPOLOGY-DEBUG)))
+        transfer-fn (:transfer-fn executor-data)
         ]
     (disruptor/clojure-handler
       (fn [tuple-batch sequence-id end-of-batch?]
         (fast-list-iter [[task-id msg] tuple-batch]
           (let [^TupleImpl tuple (if (instance? Tuple msg) msg (.deserialize deserializer msg))]
             (when debug? (log-message "Processing received message FOR " task-id " TUPLE: " tuple))
-            (if (not @(:shutting-down executor-data))
-              (if task-id
-                (tuple-action-fn task-id tuple)
-                ;; null task ids are broadcast tuples
-                (fast-list-iter [task-id task-ids]
+            (if task-id
+              (if @(:shutting-down executor-data)
+                (do
+                  (log-message "Executor is being shut down, send " task-id " " tuple " to worker")
+                  (transfer-fn task-id tuple))
+                (tuple-action-fn task-id tuple))
+              ;; null task ids are broadcast tuples
+              (fast-list-iter [task-id task-ids]
                   (tuple-action-fn task-id tuple)
                   )))
-            ))))))
+            )))))
 
 (defn executor-max-spout-pending [storm-conf num-tasks]
   (let [p (storm-conf TOPOLOGY-MAX-SPOUT-PENDING)]

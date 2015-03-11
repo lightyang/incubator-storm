@@ -895,6 +895,12 @@ public class Config extends HashMap<String, Object> {
     public static final Object TOPOLOGY_MESSAGE_TIMEOUT_SECS_SCHEMA = ConfigValidation.IntegerValidator;
 
     /**
+     * The amount of time a message with routing error has to wait before retry.
+     */
+    public static final String TOPOLOGY_MESSAGE_RETRY_SECS = "topology.message.retry.secs";
+    public static final Object TOPOLOGY_MESSAGE_RETRY_SECS_SCHEMA = ConfigValidation.IntegerValidator;
+
+    /**
      * A list of serialization registrations for Kryo ( http://code.google.com/p/kryo/ ),
      * the underlying serialization framework for Storm. A serialization can either
      * be the name of a class (in which case Kryo will automatically create a serializer for the class
@@ -1150,6 +1156,12 @@ public class Config extends HashMap<String, Object> {
      */
     public static final String TOPOLOGY_SHELLBOLT_MAX_PENDING="topology.shellbolt.max.pending";
     public static final Object TOPOLOGY_SHELLBOLT_MAX_PENDING_SCHEMA = ConfigValidation.IntegerValidator;
+
+    /**
+     * The amount of time to keep a temporary connection
+     */
+    public static final String TOPOLOGY_TEMP_CONNECTION_TIMEOUT_SECS="topology.temp.connection.timeout.secs";
+    public static final Object TOPOLOGY_TEMP_CONNECTION_TIMEOUT_SECS_SCHEMA = ConfigValidation.IntegerValidator;
 
     /**
      * The root directory in ZooKeeper for metadata about TransactionalSpouts.
