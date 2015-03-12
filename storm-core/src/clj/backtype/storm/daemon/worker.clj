@@ -177,6 +177,7 @@
         (let [retry (fn []
                       (log-message "retrying messages " (into () tuples))
                       (transfer-fn this serializer tuples))]
+          (log-message "scheduling retry messages " (into () tuples))
           (schedule timer (storm-conf TOPOLOGY-MESSAGE-RETRY-SECS) retry))))))
 
 (defn- mk-receive-queue-map [storm-conf executors]
@@ -432,6 +433,7 @@
         retry-msg-fn (:retry-msg-fn worker)]
     (disruptor/clojure-handler
       (fn [packets _ batch-end?]
+        (log-message "transfering tuples " packets)
         (.add drainer packets)
         
         (when batch-end?
@@ -540,6 +542,10 @@
 
         shutdown* (fn []
                     (log-message "Shutting down worker " storm-id " " assignment-id " " port)
+
+                    (log-message "waiting for queues to be cleaned up")
+                    (sleep-secs 1)
+
                     (doseq [[_ socket] @(:cached-node+port->socket worker)]
                       ;; this will do best effort flushing since the linger period
                       ;; was set on creation
@@ -629,4 +635,5 @@
   (let [conf (read-storm-config)]
     (validate-distributed-mode! conf)
     (let [worker (mk-worker conf nil storm-id assignment-id (Integer/parseInt port-str) worker-id)]
-      (add-shutdown-hook-with-force-kill-in-1-sec #(.shutdown worker)))))
+      (.addShutdownHook (Runtime/getRuntime) (Thread. #(.shutdown worker))))))
+      ; (add-shutdown-hook-with-force-kill-in-1-sec #(.shutdown worker)))))

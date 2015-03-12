@@ -55,13 +55,13 @@
                                    ;; through this branch, sleeping only the
                                    ;; exact necessary amount of time.
                                    ; (Time/sleep (- time-millis (current-time-millis)))
-                                   (Time/sleep 300)
+                                   (Time/sleep (Math/min 100 (- time-millis (current-time-millis))))
                                    ;; Otherwise poll to see if any new event
                                    ;; was scheduled. This is, in essence, the
                                    ;; response time for detecting any new event
                                    ;; schedulings when there are no scheduled
                                    ;; events.
-                                   (Time/sleep 300))))
+                                   (Time/sleep 100))))
                              (catch Throwable t
                                ;; Because the interrupted exception can be
                                ;; wrapped in a RuntimeException.

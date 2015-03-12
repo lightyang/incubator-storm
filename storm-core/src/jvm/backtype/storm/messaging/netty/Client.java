@@ -203,7 +203,8 @@ public class Client implements IConnection, IStatefulObject{
 
         // throw exception if the client is being closed
         if (closing) {
-            throw new RuntimeException("Client is being closed, and does not take requests any more");
+          return;
+            // throw new RuntimeException("Client is being closed, and does not take requests any more");
         }
         
         if (null == msgs || !msgs.hasNext()) {
