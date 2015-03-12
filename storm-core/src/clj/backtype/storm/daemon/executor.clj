@@ -262,6 +262,7 @@
         (let [^ArrayList alist (.getObject cached-emit)]
           (.add alist o)
           (when batch-end?
+            (log-message "transfering to worker " alist)
             (worker-transfer-fn serializer alist)
             (.setObject cached-emit (ArrayList.))
             )))
@@ -364,8 +365,11 @@
         (log-message "Shutting down executor " component-id ":" (pr-str executor-id))
         (reset! (:shutting-down executor-data) true)
         (disruptor/halt-with-interrupt! (:receive-queue executor-data))
+        (doseq [t handlers]
+          (.interrupt t)
+          (.join t))
         (disruptor/halt-with-interrupt! (:batch-transfer-queue executor-data))
-        (doseq [t threads]
+        (doseq [t system-threads]
           (.interrupt t)
           (.join t))
         

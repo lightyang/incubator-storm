@@ -132,6 +132,7 @@
             (let [local (ArrayList.)
                   remoteMap (HashMap.)
                   not-outbound (ArrayList.)]
+              (log-message "transfering batch " tuple-batch)
               (fast-list-iter [[task tuple :as pair] tuple-batch]
                 (if (@local-tasks task)
                   (.add local pair)
