@@ -260,12 +260,15 @@
       (:batch-transfer-queue executor-data)
       (disruptor/handler [o seq-id batch-end?]
         (let [^ArrayList alist (.getObject cached-emit)]
-          (.add alist o)
-          (when batch-end?
-            (log-message "transfering to worker " alist)
-            (worker-transfer-fn serializer alist)
-            (.setObject cached-emit (ArrayList.))
-            )))
+          (if @(:shutting-down executor-data)
+            (worker-transfer-fn serializer [o])
+            (do
+              (.add alist o)
+              (when batch-end?
+                (log-message "transfering to worker " alist)
+                (worker-transfer-fn serializer alist)
+                (.setObject cached-emit (ArrayList.))
+                )))))
       :kill-fn (:report-error-and-die executor-data))))
 
 (defn setup-metrics! [executor-data]
